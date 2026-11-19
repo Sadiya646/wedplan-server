@@ -86,6 +86,95 @@ async function startServer() {
       }
     });
 
+// ==========================================
+    // ADMIN PORTAL ROUTES
+    // ==========================================
+
+    // 1. Get all users (Admin)
+    app.get("/api/admin/users", async (req, res) => {
+      try {
+        const users = await usersCollection
+          .find(
+            {},
+            {
+              projection: {
+                name: 1,
+                email: 1,
+                role: 1,
+                businessName: 1,
+                isBlocked: 1,
+                createdAt: 1,
+              },
+            }
+          )
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.status(200).json({ users });
+      } catch (error) {
+        console.error("GET /api/admin/users error:", error);
+        res.status(500).json({ message: "Failed to fetch users" });
+      }
+    });
+
+    // 2. Update user role or block status (Admin)
+    app.patch("/api/admin/users/:id", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { role, isBlocked } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid user ID" });
+        }
+
+        const updateFields = { updatedAt: new Date() };
+        const allowedRoles = ["customer", "vendor", "admin"];
+
+        if (role !== undefined) {
+          if (!allowedRoles.includes(role)) {
+            return res.status(400).json({ message: "Invalid role value" });
+          }
+          updateFields.role = role;
+        }
+
+        if (typeof isBlocked === "boolean") {
+          updateFields.isBlocked = isBlocked;
+        }
+
+        const result = await usersCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: updateFields }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.status(200).json({ message: "User updated successfully" });
+      } catch (error) {
+        console.error("PATCH /api/admin/users/:id error:", error);
+        res.status(500).json({ message: "Failed to update user" });
+      }
+    });
+
+    // 3. Get all bookings (Admin)
+    app.get("/api/admin/bookings", async (req, res) => {
+      try {
+        const bookings = await bookingsCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.status(200).json({ bookings });
+      } catch (error) {
+        console.error("GET /api/admin/bookings error:", error);
+        res.status(500).json({ message: "Failed to fetch bookings" });
+      }
+    });
+
+
+
+
     // ==========================================
     // VENDOR & PUBLIC SERVICES CRUD ROUTES
     // ==========================================
