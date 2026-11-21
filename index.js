@@ -541,6 +541,49 @@ async function startServer() {
       }
     });
 
+
+
+// Express server (index.js / users route)
+app.patch("/api/users/profile", async (req, res) => {
+  try {
+    const { email, subscriptionPlan, stripeCustomerId, stripeSubscriptionId } =
+      req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    const updateFields = {};
+    if (subscriptionPlan) {
+      updateFields.subscriptionPlan = subscriptionPlan.toUpperCase();
+      updateFields.plan = subscriptionPlan.toUpperCase();
+      updateFields.upgradedAt = new Date();
+    }
+    if (stripeCustomerId) updateFields.stripeCustomerId = stripeCustomerId;
+    if (stripeSubscriptionId)
+      updateFields.stripeSubscriptionId = stripeSubscriptionId;
+
+    const result = await usersCollection.updateOne(
+      { email: email.toLowerCase() },
+      { $set: updateFields },
+      { upsert: true }
+    );
+
+    const updatedUser = await usersCollection.findOne({
+      email: email.toLowerCase(),
+    });
+
+    res.json({
+      success: true,
+      modifiedCount: result.modifiedCount,
+      user: updatedUser,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+
     // 8. Accept or Reject a booking request (Vendor)
     app.patch("/api/bookings/:id/status", async (req, res) => {
       try {
