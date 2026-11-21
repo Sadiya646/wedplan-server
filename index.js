@@ -103,6 +103,8 @@ async function startServer() {
                 role: 1,
                 businessName: 1,
                 isBlocked: 1,
+                loginCount: 1,
+                lastLoginAt: 1,
                 createdAt: 1,
               },
             }
@@ -156,6 +158,104 @@ async function startServer() {
         res.status(500).json({ message: "Failed to update user" });
       }
     });
+
+
+
+// Get user profile by email
+    app.get("/api/users/profile", async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email || !String(email).trim()) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const cleanEmail = String(email).trim().toLowerCase();
+        const foundUser = await usersCollection.findOne(
+          { email: cleanEmail },
+          {
+            projection: {
+              name: 1,
+              email: 1,
+              role: 1,
+              phone: 1,
+              eventLocation: 1,
+              eventDate: 1,
+              image: 1,
+            },
+          }
+        );
+
+        if (!foundUser) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.status(200).json({ user: foundUser });
+      } catch (error) {
+        console.error("GET /api/users/profile error:", error);
+        res.status(500).json({ message: "Failed to load profile" });
+      }
+    });
+
+    // Update user profile by email
+    app.patch("/api/users/profile", async (req, res) => {
+      try {
+        const { email, name, phone, eventLocation, eventDate } = req.body;
+        if (!email || !String(email).trim()) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const cleanEmail = String(email).trim().toLowerCase();
+        const updateFields = { updatedAt: new Date() };
+
+        if (name !== undefined && String(name).trim()) {
+          updateFields.name = String(name).trim();
+        }
+        if (phone !== undefined) {
+          updateFields.phone = String(phone).trim();
+        }
+        if (eventLocation !== undefined) {
+          updateFields.eventLocation = String(eventLocation).trim();
+        }
+        if (eventDate !== undefined) {
+          updateFields.eventDate = String(eventDate).trim();
+        }
+
+        const result = await usersCollection.updateOne(
+          { email: cleanEmail },
+          { $set: updateFields }
+        );
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        const updatedUser = await usersCollection.findOne(
+          { email: cleanEmail },
+          {
+            projection: {
+              name: 1,
+              email: 1,
+              role: 1,
+              phone: 1,
+              eventLocation: 1,
+              eventDate: 1,
+            },
+          }
+        );
+
+        res.status(200).json({
+          message: "Profile updated successfully",
+          user: updatedUser,
+        });
+      } catch (error) {
+        console.error("PATCH /api/users/profile error:", error);
+        res.status(500).json({ message: "Failed to update profile" });
+      }
+    });
+
+
+
+
 
     // 3. Get all bookings (Admin)
     app.get("/api/admin/bookings", async (req, res) => {
@@ -547,6 +647,33 @@ async function startServer() {
         res.status(500).json({ message: "Failed to create booking request" });
       }
     });
+
+
+
+    // Record user sign-in timestamp & count
+    app.post("/api/users/login-activity", async (req, res) => {
+      try {
+        const { email } = req.body;
+        if (!email || !String(email).trim()) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const cleanEmail = String(email).trim().toLowerCase();
+        await usersCollection.updateOne(
+          { email: cleanEmail },
+          {
+            $set: { lastLoginAt: new Date() },
+            $inc: { loginCount: 1 },
+          }
+        );
+
+        res.status(200).json({ message: "Login activity recorded" });
+      } catch (error) {
+        console.error("POST /api/users/login-activity error:", error);
+        res.status(500).json({ message: "Failed to record login activity" });
+      }
+    });
+
 
     // 11. Cancel a pending booking
     app.patch("/api/bookings/:id/cancel", async (req, res) => {
