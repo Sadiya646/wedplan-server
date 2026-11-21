@@ -7,7 +7,8 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-
+const escapeRegex = (str) =>
+  String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -162,7 +163,7 @@ async function startServer() {
 
 
 // Get user profile by email
-    app.get("/api/users/profile", async (req, res) => {
+  app.get("/api/users/profile", async (req, res) => {
       try {
         const email = req.query.email;
         if (!email || !String(email).trim()) {
@@ -170,20 +171,21 @@ async function startServer() {
         }
 
         const cleanEmail = String(email).trim().toLowerCase();
-        const foundUser = await usersCollection.findOne(
-          { email: cleanEmail },
-          {
-            projection: {
-              name: 1,
-              email: 1,
-              role: 1,
-              phone: 1,
-              eventLocation: 1,
-              eventDate: 1,
-              image: 1,
-            },
-          }
-        );
+        const emailQuery = {
+          email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
+        };
+
+        const foundUser = await usersCollection.findOne(emailQuery, {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            phone: 1,
+            eventLocation: 1,
+            eventDate: 1,
+            image: 1,
+          },
+        });
 
         if (!foundUser) {
           return res.status(404).json({ message: "User not found" });
@@ -196,7 +198,7 @@ async function startServer() {
       }
     });
 
-    // Update user profile by email
+    // Update user profile by email (case-insensitive)
     app.patch("/api/users/profile", async (req, res) => {
       try {
         const { email, name, phone, eventLocation, eventDate } = req.body;
@@ -205,6 +207,10 @@ async function startServer() {
         }
 
         const cleanEmail = String(email).trim().toLowerCase();
+        const emailQuery = {
+          email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
+        };
+
         const updateFields = { updatedAt: new Date() };
 
         if (name !== undefined && String(name).trim()) {
@@ -220,28 +226,24 @@ async function startServer() {
           updateFields.eventDate = String(eventDate).trim();
         }
 
-        const result = await usersCollection.updateOne(
-          { email: cleanEmail },
-          { $set: updateFields }
-        );
+        const result = await usersCollection.updateOne(emailQuery, {
+          $set: updateFields,
+        });
 
         if (result.matchedCount === 0) {
           return res.status(404).json({ message: "User not found" });
         }
 
-        const updatedUser = await usersCollection.findOne(
-          { email: cleanEmail },
-          {
-            projection: {
-              name: 1,
-              email: 1,
-              role: 1,
-              phone: 1,
-              eventLocation: 1,
-              eventDate: 1,
-            },
-          }
-        );
+        const updatedUser = await usersCollection.findOne(emailQuery, {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            phone: 1,
+            eventLocation: 1,
+            eventDate: 1,
+          },
+        });
 
         res.status(200).json({
           message: "Profile updated successfully",
