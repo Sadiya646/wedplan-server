@@ -19,4 +19,9 @@ WedPlan Server is the backend REST API for **WedPlan**, a role-based wedding pla
 
 1. Clone the server repository:
    ```bash
-   git clone [https://github.com/Sadiya646/wedplan-server.git](https://github.com/Sadiya646/wedplan-server.git)
+   git clone https://github.com/Sadiya646/wedplan-server.git
+
+## Live Link
+```bash
+wedplan-client-coral.vercel.app
+wedplan-server-sooty.vercel.app
