@@ -1,21 +1,26 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import Stripe from "stripe";
 import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const stripe = process.env.STRIPE_SECRET_KEY
+  ? new Stripe(process.env.STRIPE_SECRET_KEY)
+  : null;
+
 const escapeRegex = (str) =>
   String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
     credentials: true,
   })
 );
-app.use(express.json());
 
 // MongoDB Atlas Connection
 const uri =
@@ -41,8 +46,107 @@ const db = client.db(dbName);
 const servicesCollection = db.collection("services");
 const bookingsCollection = db.collection("bookings");
 const usersCollection = db.collection("user");
+const transactionsCollection = db.collection("transactions");
 
-// Connect to MongoDB once and start server
+// ==========================================
+// STRIPE WEBHOOK ROUTE (MUST BE BEFORE express.json())
+// ==========================================
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+        return res
+          .status(500)
+          .send("Stripe or STRIPE_WEBHOOK_SECRET is not configured on server");
+      }
+
+      const sig = req.headers["stripe-signature"];
+      let event;
+
+      try {
+        event = stripe.webhooks.constructEvent(
+          req.body,
+          sig,
+          process.env.STRIPE_WEBHOOK_SECRET
+        );
+      } catch (err) {
+        console.error("Webhook signature verification failed:", err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+      }
+
+      if (event.type === "checkout.session.completed") {
+        const session = event.data.object;
+        const vendorEmail = String(
+          session.metadata?.email || session.customer_details?.email || ""
+        )
+          .trim()
+          .toLowerCase();
+
+        if (vendorEmail) {
+          const emailQuery = {
+            email: { $regex: new RegExp(`^${escapeRegex(vendorEmail)}$`, "i") },
+          };
+          const vendor = await usersCollection.findOne(emailQuery);
+
+          await usersCollection.updateOne(emailQuery, {
+            $set: {
+              subscriptionPlan: "PREMIUM",
+              plan: "PREMIUM",
+              stripeCustomerId: session.customer || "",
+              stripeSubscriptionId: session.subscription || "",
+              upgradedAt: new Date(),
+              updatedAt: new Date(),
+            },
+          });
+
+          const existingTx = await transactionsCollection.findOne({
+            stripeSessionId: session.id,
+          });
+
+          if (!existingTx) {
+            await transactionsCollection.insertOne({
+              vendorId: vendor?._id ? String(vendor._id) : "",
+              vendorName: vendor?.businessName || vendor?.name || "Vendor",
+              vendorEmail,
+              plan: "PREMIUM",
+              amount: session.amount_total ? session.amount_total / 100 : 29,
+              currency: (session.currency || "usd").toUpperCase(),
+              stripeSessionId: session.id,
+              stripeSubscriptionId: session.subscription || "",
+              status: "SUCCESS",
+              createdAt: new Date(),
+            });
+          }
+        }
+      }
+
+      if (event.type === "customer.subscription.deleted") {
+        const subscription = event.data.object;
+        await usersCollection.updateOne(
+          { stripeSubscriptionId: subscription.id },
+          {
+            $set: {
+              subscriptionPlan: "FREE",
+              plan: "FREE",
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
+
+      return res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("POST /api/webhooks/stripe error:", error);
+      return res.status(500).json({ message: "Webhook processing failed" });
+    }
+  }
+);
+
+// JSON parser MUST come AFTER /api/webhooks/stripe
+app.use(express.json());
+
 async function startServer() {
   try {
     await client.connect();
@@ -60,10 +164,10 @@ async function startServer() {
     });
 
     // ==========================================
-    // USER ROLE LOOKUP ROUTE
+    // USER ROLE & PROFILE ROUTES
     // ==========================================
 
-    // Get role by user email
+    // Get role & subscription status by user email
     app.get("/api/users/role", async (req, res) => {
       try {
         const email = req.query.email;
@@ -71,15 +175,30 @@ async function startServer() {
           return res.status(400).json({ message: "Email is required" });
         }
 
+        const cleanEmail = String(email).trim().toLowerCase();
         const foundUser = await usersCollection.findOne(
-          { email: String(email).trim() },
-          { projection: { role: 1, isBlocked: 1, businessName: 1 } }
+          {
+            email: {
+              $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i"),
+            },
+          },
+          {
+            projection: {
+              role: 1,
+              isBlocked: 1,
+              businessName: 1,
+              subscriptionPlan: 1,
+              plan: 1,
+            },
+          }
         );
 
         res.status(200).json({
           role: foundUser?.role || "customer",
           isBlocked: Boolean(foundUser?.isBlocked),
           businessName: foundUser?.businessName || "",
+          subscriptionPlan:
+            foundUser?.subscriptionPlan || foundUser?.plan || "FREE",
         });
       } catch (error) {
         console.error("GET /api/users/role error:", error);
@@ -87,7 +206,138 @@ async function startServer() {
       }
     });
 
-// ==========================================
+    // Get user profile & subscription plan by email
+    app.get("/api/users/profile", async (req, res) => {
+      try {
+        const email = req.query.email;
+        if (!email || !String(email).trim()) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const cleanEmail = String(email).trim().toLowerCase();
+        const emailQuery = {
+          email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
+        };
+
+        const foundUser = await usersCollection.findOne(emailQuery, {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            phone: 1,
+            eventLocation: 1,
+            eventDate: 1,
+            image: 1,
+            subscriptionPlan: 1,
+            plan: 1,
+            stripeCustomerId: 1,
+            stripeSubscriptionId: 1,
+            upgradedAt: 1,
+          },
+        });
+
+        if (!foundUser) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        res.status(200).json({ user: foundUser });
+      } catch (error) {
+        console.error("GET /api/users/profile error:", error);
+        res.status(500).json({ message: "Failed to load profile" });
+      }
+    });
+
+    // Update user profile ONLY (role & subscriptionPlan cannot be self-modified here)
+    app.patch("/api/users/profile", async (req, res) => {
+      try {
+        const { email, name, phone, eventLocation, eventDate, image } =
+          req.body;
+
+        if (!email || !String(email).trim()) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const cleanEmail = String(email).trim().toLowerCase();
+        const emailQuery = {
+          email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
+        };
+
+        const updateFields = { updatedAt: new Date() };
+
+        if (name !== undefined && String(name).trim()) {
+          updateFields.name = String(name).trim();
+        }
+        if (phone !== undefined) {
+          updateFields.phone = String(phone).trim();
+        }
+        if (eventLocation !== undefined) {
+          updateFields.eventLocation = String(eventLocation).trim();
+        }
+        if (eventDate !== undefined) {
+          updateFields.eventDate = String(eventDate).trim();
+        }
+        if (image !== undefined) {
+          updateFields.image = String(image).trim();
+        }
+
+        const result = await usersCollection.updateOne(emailQuery, {
+          $set: updateFields,
+        });
+
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        const updatedUser = await usersCollection.findOne(emailQuery, {
+          projection: {
+            name: 1,
+            email: 1,
+            role: 1,
+            phone: 1,
+            eventLocation: 1,
+            eventDate: 1,
+            image: 1,
+            subscriptionPlan: 1,
+            plan: 1,
+            upgradedAt: 1,
+          },
+        });
+
+        res.status(200).json({
+          message: "Profile updated successfully",
+          user: updatedUser,
+        });
+      } catch (error) {
+        console.error("PATCH /api/users/profile error:", error);
+        res.status(500).json({ message: "Failed to update profile" });
+      }
+    });
+
+    // Record user sign-in timestamp & count
+    app.post("/api/users/login-activity", async (req, res) => {
+      try {
+        const { email } = req.body;
+        if (!email || !String(email).trim()) {
+          return res.status(400).json({ message: "Email is required" });
+        }
+
+        const cleanEmail = String(email).trim().toLowerCase();
+        await usersCollection.updateOne(
+          { email: cleanEmail },
+          {
+            $set: { lastLoginAt: new Date() },
+            $inc: { loginCount: 1 },
+          }
+        );
+
+        res.status(200).json({ message: "Login activity recorded" });
+      } catch (error) {
+        console.error("POST /api/users/login-activity error:", error);
+        res.status(500).json({ message: "Failed to record login activity" });
+      }
+    });
+
+    // ==========================================
     // ADMIN PORTAL ROUTES
     // ==========================================
 
@@ -103,6 +353,8 @@ async function startServer() {
                 email: 1,
                 role: 1,
                 businessName: 1,
+                subscriptionPlan: 1,
+                plan: 1,
                 isBlocked: 1,
                 loginCount: 1,
                 lastLoginAt: 1,
@@ -119,6 +371,48 @@ async function startServer() {
         res.status(500).json({ message: "Failed to fetch users" });
       }
     });
+
+
+
+// Admin: Get ALL services (Pending, Approved, Rejected)
+app.get("/api/admin/services", async (req, res) => {
+  try {
+    const services = await servicesCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.status(200).json({ services });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch all services" });
+  }
+});
+
+// Admin: Approve or Reject a service
+app.patch("/api/admin/services/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ message: "Invalid service ID" });
+    }
+    if (!["APPROVED", "REJECTED", "PENDING"].includes(status)) {
+      return res.status(400).json({ message: "Invalid status" });
+    }
+
+    const result = await servicesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ message: "Service not found" });
+    }
+
+    res.status(200).json({ message: `Service marked as ${status}` });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to update service status" });
+  }
+});
 
     // 2. Update user role or block status (Admin)
     app.patch("/api/admin/users/:id", async (req, res) => {
@@ -160,105 +454,6 @@ async function startServer() {
       }
     });
 
-
-
-// Get user profile by email
-  app.get("/api/users/profile", async (req, res) => {
-      try {
-        const email = req.query.email;
-        if (!email || !String(email).trim()) {
-          return res.status(400).json({ message: "Email is required" });
-        }
-
-        const cleanEmail = String(email).trim().toLowerCase();
-        const emailQuery = {
-          email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
-        };
-
-        const foundUser = await usersCollection.findOne(emailQuery, {
-          projection: {
-            name: 1,
-            email: 1,
-            role: 1,
-            phone: 1,
-            eventLocation: 1,
-            eventDate: 1,
-            image: 1,
-          },
-        });
-
-        if (!foundUser) {
-          return res.status(404).json({ message: "User not found" });
-        }
-
-        res.status(200).json({ user: foundUser });
-      } catch (error) {
-        console.error("GET /api/users/profile error:", error);
-        res.status(500).json({ message: "Failed to load profile" });
-      }
-    });
-
-    // Update user profile by email (case-insensitive)
-    app.patch("/api/users/profile", async (req, res) => {
-      try {
-        const { email, name, phone, eventLocation, eventDate } = req.body;
-        if (!email || !String(email).trim()) {
-          return res.status(400).json({ message: "Email is required" });
-        }
-
-        const cleanEmail = String(email).trim().toLowerCase();
-        const emailQuery = {
-          email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
-        };
-
-        const updateFields = { updatedAt: new Date() };
-
-        if (name !== undefined && String(name).trim()) {
-          updateFields.name = String(name).trim();
-        }
-        if (phone !== undefined) {
-          updateFields.phone = String(phone).trim();
-        }
-        if (eventLocation !== undefined) {
-          updateFields.eventLocation = String(eventLocation).trim();
-        }
-        if (eventDate !== undefined) {
-          updateFields.eventDate = String(eventDate).trim();
-        }
-
-        const result = await usersCollection.updateOne(emailQuery, {
-          $set: updateFields,
-        });
-
-        if (result.matchedCount === 0) {
-          return res.status(404).json({ message: "User not found" });
-        }
-
-        const updatedUser = await usersCollection.findOne(emailQuery, {
-          projection: {
-            name: 1,
-            email: 1,
-            role: 1,
-            phone: 1,
-            eventLocation: 1,
-            eventDate: 1,
-          },
-        });
-
-        res.status(200).json({
-          message: "Profile updated successfully",
-          user: updatedUser,
-        });
-      } catch (error) {
-        console.error("PATCH /api/users/profile error:", error);
-        res.status(500).json({ message: "Failed to update profile" });
-      }
-    });
-
-
-
-
-
     // 3. Get all bookings (Admin)
     app.get("/api/admin/bookings", async (req, res) => {
       try {
@@ -274,8 +469,113 @@ async function startServer() {
       }
     });
 
+    // 4. Get all subscription transactions (Admin)
+    app.get("/api/admin/transactions", async (req, res) => {
+      try {
+        const transactions = await transactionsCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
 
+        res.status(200).json({ transactions });
+      } catch (error) {
+        console.error("GET /api/admin/transactions error:", error);
+        res.status(500).json({ message: "Failed to fetch transactions" });
+      }
+    });
 
+    // 5. Server-side Stripe session verification (syncs DB if webhook hasn't arrived yet)
+    app.post("/api/stripe/verify-session", async (req, res) => {
+      try {
+        if (!stripe) {
+          return res
+            .status(500)
+            .json({ message: "STRIPE_SECRET_KEY is missing on Express server" });
+        }
+
+        const { sessionId } = req.body;
+        if (!sessionId || !String(sessionId).trim()) {
+          return res.status(400).json({ message: "sessionId is required" });
+        }
+
+        const session = await stripe.checkout.sessions.retrieve(
+          String(sessionId).trim()
+        );
+
+        const isPaid =
+          session.payment_status === "paid" || session.status === "complete";
+
+        if (!isPaid) {
+          return res.status(400).json({
+            verified: false,
+            message: "Payment is not completed yet",
+          });
+        }
+
+        const vendorEmail = String(
+          session.metadata?.email || session.customer_details?.email || ""
+        )
+          .trim()
+          .toLowerCase();
+
+        if (!vendorEmail) {
+          return res
+            .status(400)
+            .json({ message: "Vendor email not found in Stripe session" });
+        }
+
+        const emailQuery = {
+          email: { $regex: new RegExp(`^${escapeRegex(vendorEmail)}$`, "i") },
+        };
+        const vendor = await usersCollection.findOne(emailQuery);
+
+        await usersCollection.updateOne(emailQuery, {
+          $set: {
+            subscriptionPlan: "PREMIUM",
+            plan: "PREMIUM",
+            stripeCustomerId:
+              typeof session.customer === "string" ? session.customer : "",
+            stripeSubscriptionId:
+              typeof session.subscription === "string"
+                ? session.subscription
+                : "",
+            upgradedAt: new Date(),
+            updatedAt: new Date(),
+          },
+        });
+
+        const existingTx = await transactionsCollection.findOne({
+          stripeSessionId: session.id,
+        });
+
+        if (!existingTx) {
+          await transactionsCollection.insertOne({
+            vendorId: vendor?._id ? String(vendor._id) : "",
+            vendorName: vendor?.businessName || vendor?.name || "Vendor",
+            vendorEmail,
+            plan: "PREMIUM",
+            amount: session.amount_total ? session.amount_total / 100 : 29,
+            currency: (session.currency || "usd").toUpperCase(),
+            stripeSessionId: session.id,
+            stripeSubscriptionId:
+              typeof session.subscription === "string"
+                ? session.subscription
+                : "",
+            status: "SUCCESS",
+            createdAt: new Date(),
+          });
+        }
+
+        return res.status(200).json({
+          verified: true,
+          subscriptionPlan: "PREMIUM",
+          email: vendorEmail,
+        });
+      } catch (error) {
+        console.error("POST /api/stripe/verify-session error:", error);
+        return res.status(500).json({ message: error.message });
+      }
+    });
 
     // ==========================================
     // VENDOR & PUBLIC SERVICES CRUD ROUTES
@@ -327,6 +627,8 @@ async function startServer() {
 
         if (sort === "price-asc") {
           cursor = cursor.sort({ price: 1, createdAt: -1 });
+        } else if (sort === "price-desc") {
+          cursor = cursor.sort({ price: -1, createdAt: -1 });
         } else if (sort === "rating-desc") {
           cursor = cursor.sort({ rating: -1, createdAt: -1 });
         } else {
@@ -364,7 +666,7 @@ async function startServer() {
       }
     });
 
-    // 4. Create a new service (Vendor)
+    // 4. Create a new service (Vendor, with FREE plan 3-service server-side limit)
     app.post("/api/services", async (req, res) => {
       try {
         const {
@@ -396,6 +698,40 @@ async function startServer() {
             .json({ message: "Missing or invalid required service fields" });
         }
 
+        const cleanVendorEmail = String(vendorEmail).trim().toLowerCase();
+        const vendorUser = await usersCollection.findOne({
+          email: {
+            $regex: new RegExp(`^${escapeRegex(cleanVendorEmail)}$`, "i"),
+          },
+        });
+
+        if (vendorUser?.isBlocked) {
+          return res
+            .status(403)
+            .json({ message: "Blocked accounts cannot publish services" });
+        }
+
+        const currentPlan = (
+          vendorUser?.subscriptionPlan ||
+          vendorUser?.plan ||
+          "FREE"
+        ).toUpperCase();
+
+        if (currentPlan !== "PREMIUM") {
+          const existingCount = await servicesCollection.countDocuments({
+            vendorEmail: {
+              $regex: new RegExp(`^${escapeRegex(cleanVendorEmail)}$`, "i"),
+            },
+          });
+
+          if (existingCount >= 3) {
+            return res.status(403).json({
+              message:
+                "Free plan allows up to 3 services. Upgrade to Vendor Premium for unlimited listings.",
+            });
+          }
+        }
+
         const newService = {
           title: String(title).trim(),
           category: String(category).trim(),
@@ -406,7 +742,7 @@ async function startServer() {
           vendorEmail: String(vendorEmail).trim(),
           vendorName: String(vendorName || "Verified Studio").trim(),
           rating: 5.0,
-          status: "APPROVED",
+          status: "PENDING",
           createdAt: new Date(),
         };
 
@@ -541,49 +877,6 @@ async function startServer() {
       }
     });
 
-
-
-// Express server (index.js / users route)
-app.patch("/api/users/profile", async (req, res) => {
-  try {
-    const { email, subscriptionPlan, stripeCustomerId, stripeSubscriptionId } =
-      req.body;
-
-    if (!email) {
-      return res.status(400).json({ message: "Email is required" });
-    }
-
-    const updateFields = {};
-    if (subscriptionPlan) {
-      updateFields.subscriptionPlan = subscriptionPlan.toUpperCase();
-      updateFields.plan = subscriptionPlan.toUpperCase();
-      updateFields.upgradedAt = new Date();
-    }
-    if (stripeCustomerId) updateFields.stripeCustomerId = stripeCustomerId;
-    if (stripeSubscriptionId)
-      updateFields.stripeSubscriptionId = stripeSubscriptionId;
-
-    const result = await usersCollection.updateOne(
-      { email: email.toLowerCase() },
-      { $set: updateFields },
-      { upsert: true }
-    );
-
-    const updatedUser = await usersCollection.findOne({
-      email: email.toLowerCase(),
-    });
-
-    res.json({
-      success: true,
-      modifiedCount: result.modifiedCount,
-      user: updatedUser,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
-
-
     // 8. Accept or Reject a booking request (Vendor)
     app.patch("/api/bookings/:id/status", async (req, res) => {
       try {
@@ -601,12 +894,14 @@ app.patch("/api/users/profile", async (req, res) => {
         }
 
         const result = await bookingsCollection.updateOne(
-          { _id: new ObjectId(id) },
+          { _id: new ObjectId(id), status: "PENDING" },
           { $set: { status, updatedAt: new Date() } }
         );
 
         if (result.matchedCount === 0) {
-          return res.status(404).json({ message: "Booking not found" });
+          return res
+            .status(400)
+            .json({ message: "Booking not found or already processed" });
         }
 
         res.status(200).json({ message: `Booking status updated to ${status}` });
@@ -667,6 +962,16 @@ app.patch("/api/users/profile", async (req, res) => {
             .json({ message: "Missing required booking fields" });
         }
 
+        if (
+          vendorEmail &&
+          String(vendorEmail).trim().toLowerCase() ===
+            String(customerEmail).trim().toLowerCase()
+        ) {
+          return res
+            .status(400)
+            .json({ message: "You cannot book your own service" });
+        }
+
         const newBooking = {
           serviceId: String(serviceId || "").trim(),
           serviceTitle: String(serviceTitle).trim(),
@@ -692,33 +997,6 @@ app.patch("/api/users/profile", async (req, res) => {
         res.status(500).json({ message: "Failed to create booking request" });
       }
     });
-
-
-
-    // Record user sign-in timestamp & count
-    app.post("/api/users/login-activity", async (req, res) => {
-      try {
-        const { email } = req.body;
-        if (!email || !String(email).trim()) {
-          return res.status(400).json({ message: "Email is required" });
-        }
-
-        const cleanEmail = String(email).trim().toLowerCase();
-        await usersCollection.updateOne(
-          { email: cleanEmail },
-          {
-            $set: { lastLoginAt: new Date() },
-            $inc: { loginCount: 1 },
-          }
-        );
-
-        res.status(200).json({ message: "Login activity recorded" });
-      } catch (error) {
-        console.error("POST /api/users/login-activity error:", error);
-        res.status(500).json({ message: "Failed to record login activity" });
-      }
-    });
-
 
     // 11. Cancel a pending booking
     app.patch("/api/bookings/:id/cancel", async (req, res) => {
