@@ -23,7 +23,7 @@ app.use(
     ],
     credentials: true,
   })
-)
+);
 
 // MongoDB Atlas Connection
 const uri =
@@ -375,47 +375,45 @@ async function startServer() {
       }
     });
 
+    // Admin: Get ALL services (Pending, Approved, Rejected)
+    app.get("/api/admin/services", async (req, res) => {
+      try {
+        const services = await servicesCollection
+          .find({})
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.status(200).json({ services });
+      } catch (error) {
+        res.status(500).json({ message: "Failed to fetch all services" });
+      }
+    });
 
+    // Admin: Approve or Reject a service
+    app.patch("/api/admin/services/:id/status", async (req, res) => {
+      try {
+        const { id } = req.params;
+        const { status } = req.body;
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).json({ message: "Invalid service ID" });
+        }
+        if (!["APPROVED", "REJECTED", "PENDING"].includes(status)) {
+          return res.status(400).json({ message: "Invalid status" });
+        }
 
-// Admin: Get ALL services (Pending, Approved, Rejected)
-app.get("/api/admin/services", async (req, res) => {
-  try {
-    const services = await servicesCollection
-      .find({})
-      .sort({ createdAt: -1 })
-      .toArray();
-    res.status(200).json({ services });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to fetch all services" });
-  }
-});
+        const result = await servicesCollection.updateOne(
+          { _id: new ObjectId(id) },
+          { $set: { status, updatedAt: new Date() } }
+        );
 
-// Admin: Approve or Reject a service
-app.patch("/api/admin/services/:id/status", async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid service ID" });
-    }
-    if (!["APPROVED", "REJECTED", "PENDING"].includes(status)) {
-      return res.status(400).json({ message: "Invalid status" });
-    }
+        if (result.matchedCount === 0) {
+          return res.status(404).json({ message: "Service not found" });
+        }
 
-    const result = await servicesCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status, updatedAt: new Date() } }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ message: "Service not found" });
-    }
-
-    res.status(200).json({ message: `Service marked as ${status}` });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to update service status" });
-  }
-});
+        res.status(200).json({ message: `Service marked as ${status}` });
+      } catch (error) {
+        res.status(500).json({ message: "Failed to update service status" });
+      }
+    });
 
     // 2. Update user role or block status (Admin)
     app.patch("/api/admin/users/:id", async (req, res) => {
@@ -606,18 +604,25 @@ app.patch("/api/admin/services/:id/status", async (req, res) => {
       }
     });
 
-    // 2. Get public services for Browse Services / Home (with search, category, sort)
+    // 2. Get public services for Browse Services / Home (ONLY APPROVED & ACTIVE)
     app.get("/api/services", async (req, res) => {
       try {
-        const { category, search, sort } = req.query;
-        const query = {};
+        const { category, search, location, sort } = req.query;
+        const query = {
+          status: "APPROVED",
+          isAvailable: { $ne: false },
+        };
 
         if (category && String(category) !== "All") {
           query.category = String(category).trim();
         }
 
+        if (location && String(location).trim()) {
+          query.location = new RegExp(escapeRegex(String(location).trim()), "i");
+        }
+
         if (search && String(search).trim()) {
-          const regex = new RegExp(String(search).trim(), "i");
+          const regex = new RegExp(escapeRegex(String(search).trim()), "i");
           query.$or = [
             { title: regex },
             { vendorName: regex },
@@ -746,6 +751,7 @@ app.patch("/api/admin/services/:id/status", async (req, res) => {
           vendorName: String(vendorName || "Verified Studio").trim(),
           rating: 5.0,
           status: "PENDING",
+          isAvailable: true,
           createdAt: new Date(),
         };
 
@@ -768,7 +774,15 @@ app.patch("/api/admin/services/:id/status", async (req, res) => {
           return res.status(400).json({ message: "Invalid service ID" });
         }
 
-        const { title, category, location, price, summary, image } = req.body;
+        const {
+          title,
+          category,
+          location,
+          price,
+          summary,
+          image,
+          isAvailable,
+        } = req.body;
         const updateFields = {
           updatedAt: new Date(),
         };
@@ -806,6 +820,10 @@ app.patch("/api/admin/services/:id/status", async (req, res) => {
 
         if (image !== undefined) {
           updateFields.image = String(image).trim();
+        }
+
+        if (typeof isAvailable === "boolean") {
+          updateFields.isAvailable = isAvailable;
         }
 
         const result = await servicesCollection.updateOne(
@@ -973,6 +991,44 @@ app.patch("/api/admin/services/:id/status", async (req, res) => {
           return res
             .status(400)
             .json({ message: "You cannot book your own service" });
+        }
+
+        // Check if customer is blocked or admin
+        const customerUser = await usersCollection.findOne({
+          email: {
+            $regex: new RegExp(
+              `^${escapeRegex(String(customerEmail).trim())}$`,
+              "i"
+            ),
+          },
+        });
+
+        if (customerUser?.isBlocked) {
+          return res
+            .status(403)
+            .json({ message: "Blocked accounts cannot submit bookings" });
+        }
+
+        if (customerUser?.role === "admin") {
+          return res
+            .status(403)
+            .json({ message: "Admins cannot submit customer booking requests" });
+        }
+
+        // Prevent duplicate active booking for same service & eventDate
+        if (serviceId) {
+          const duplicate = await bookingsCollection.findOne({
+            serviceId: String(serviceId).trim(),
+            eventDate: String(eventDate).trim(),
+            status: { $in: ["PENDING", "ACCEPTED"] },
+          });
+
+          if (duplicate) {
+            return res.status(409).json({
+              message:
+                "An active booking request already exists for this service on the selected date.",
+            });
+          }
         }
 
         const newBooking = {
