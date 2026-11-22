@@ -1,6 +1,4 @@
----
 
-### 2. Server Side `README.md` (`wedplan-server/README.md`)
 
 ```markdown
 # WedPlan Server — Wedding Planning Platform Backend API
