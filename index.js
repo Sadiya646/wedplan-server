@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import Stripe from "stripe";
 import { MongoClient, ObjectId, ServerApiVersion } from "mongodb";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
@@ -1056,6 +1057,79 @@ async function startServer() {
         res.status(500).json({ message: "Failed to create booking request" });
       }
     });
+
+
+
+
+
+
+// ==========================================
+// JWT & ROLE VERIFICATION MIDDLEWARE
+// ==========================================
+const verifyJWT = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .json({ message: "Unauthorized: Missing Bearer token" });
+    }
+
+    const token = authHeader.split(" ")[1];
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+      return res
+        .status(500)
+        .json({ message: "Server JWT_SECRET is not configured" });
+    }
+
+    const decoded = jwt.verify(token, secret);
+    const cleanEmail = String(decoded.email || "").trim().toLowerCase();
+
+    // Always verify real role & blocked status from MongoDB
+    const dbUser = await usersCollection.findOne({
+      email: { $regex: new RegExp(`^${escapeRegex(cleanEmail)}$`, "i") },
+    });
+
+    if (!dbUser) {
+      return res.status(401).json({ message: "Unauthorized: User not found" });
+    }
+
+    if (dbUser.isBlocked) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: Your account has been blocked" });
+    }
+
+    req.user = {
+      id: String(dbUser._id),
+      email: dbUser.email,
+      role: dbUser.role || "customer",
+      subscriptionPlan: dbUser.subscriptionPlan || dbUser.plan || "FREE",
+    };
+
+    next();
+  } catch (error) {
+    return res
+      .status(401)
+      .json({ message: "Unauthorized: Invalid or expired token" });
+  }
+};
+
+const verifyRole = (...allowedRoles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    if (!allowedRoles.includes(req.user.role)) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: Insufficient permissions" });
+    }
+    next();
+  };
+};
+
 
     // 11. Cancel a pending booking
     app.patch("/api/bookings/:id/cancel", async (req, res) => {
